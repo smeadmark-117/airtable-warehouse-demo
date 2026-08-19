@@ -9,7 +9,9 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Database,
+  FileText,
   Forklift,
+  Layers,
   MapPinned,
   PackageCheck,
   Plus,
@@ -19,11 +21,15 @@ import {
   RotateCcw,
   Search,
   ShoppingCart,
+  Sparkles,
   Truck,
+  Upload,
   UserCheck,
   UserPlus
 } from "lucide-react";
 import { demoData, type Assignment, type Bin, type Pallet, type PickTask } from "./seedData";
+import { SagePdfUploader } from "./components/SagePdfUploader";
+import { type AirtableUnit, type InboundParseResult, SEED_AIRTABLE_UNITS } from "./airtableService";
 import "./styles.css";
 
 type Tab = "office" | "driver" | "customer" | "map" | "reports" | "tags" | "sage";
@@ -63,13 +69,15 @@ function App() {
   const [breakBags, setBreakBags] = useState(0);
   const [breakReason, setBreakReason] = useState("Customer requested partial box count");
 
-  // Dynamic state for Sage imports & Driver assignments
+  // Dynamic state for Sage imports, PDF uploads, & Driver assignments
   const [incomingOrders, setIncomingOrders] = useState(demoData.incomingOrders);
   const [outboundOrders, setOutboundOrders] = useState(demoData.outboundOrders);
   const [assignments, setAssignments] = useState<Assignment[]>(demoData.assignments);
   const [customerOrders, setCustomerOrders] = useState(demoData.customerOrders);
+  const [airtableUnits, setAirtableUnits] = useState<AirtableUnit[]>(SEED_AIRTABLE_UNITS.slice(0, 4));
+  const [tagFilter, setTagFilter] = useState<"all" | "airtable" | "demo">("all");
   const [airtableSyncLog, setAirtableSyncLog] = useState<string[]>([
-    `[${new Date().toLocaleTimeString()}] Connected to Airtable Base appdSedUhOfcqzMUZ. Ready for Sage Order Stream.`
+    `[${new Date().toLocaleTimeString()}] Connected to Airtable Base appdSedUhOfcqzMUZ. Ready for Sage Order Stream & PDF Inbound Ingestion.`
   ]);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -124,6 +132,59 @@ function App() {
     ]);
 
     triggerToast(`Order ${order.id} imported from Sage! ${driverName ? `Assigned to driver ${driverName}.` : "Unassigned."}`);
+  };
+
+  const handlePdfOrderImported = (result: InboundParseResult, driverId: string) => {
+    // 1. Add to incoming orders
+    setIncomingOrders((prev) => [
+      {
+        id: result.poNumber,
+        supplier: result.vendorName,
+        pallets: result.pulledUnits.length || 6,
+        status: driverId ? "Assigned" : "Unassigned"
+      },
+      ...prev
+    ]);
+
+    // 2. Add customer order
+    setCustomerOrders((prev) => [
+      {
+        id: result.poNumber,
+        customer: result.vendorName,
+        product: result.pulledUnits[0]?.productName || "Potato Plastic Bags",
+        quantity: result.pulledUnits.reduce((s, u) => s + u.quantity, 0),
+        unit: result.pulledUnits[0]?.unitType || "boxes",
+        requestedShipDate: "Today (Sage Inbound PDF)",
+        status: driverId ? "Assigned" : "Pending Driver"
+      },
+      ...prev
+    ]);
+
+    // 3. Create driver assignment
+    const newAsnId = `ASN-R-${Math.floor(100 + Math.random() * 900)}`;
+    const driverName = demoData.drivers.find((d) => d.id === driverId)?.name;
+    const newAssignment: Assignment = {
+      id: newAsnId,
+      driverId: driverId || "unassigned",
+      type: "Receiving",
+      title: `Receive ${result.vendorName} (${result.poNumber}) [Airtable PDF]`,
+      status: driverId ? "Assigned" : "Unassigned"
+    };
+
+    setAssignments((prev) => [newAssignment, ...prev]);
+
+    // 4. Update pulled Airtable units
+    setAirtableUnits(result.pulledUnits);
+
+    // 5. Update Airtable audit log
+    const time = new Date().toLocaleTimeString();
+    const unitList = result.pulledUnits.map((u) => `${u.unitId} (${u.binId})`).join(", ");
+    setAirtableSyncLog((prev) => [
+      `[${time}] SAGE PDF INGESTION: Attached "${result.fileName}" (${result.fileSize}) to Airtable table "Inbound Transactions" (ID: ${result.transactionRecordId}, Attachment: ${result.attachmentId || "att-synced"}). Airtable AI extracted PO ${result.poNumber} from ${result.vendorName}. Pulled ${result.pulledUnits.length} live units [${unitList}] from Airtable base appdSedUhOfcqzMUZ. Pallet tags ready for printing. ${driverName ? `Assigned to ${driverName}.` : "Awaiting driver assignment."}`,
+      ...prev
+    ]);
+
+    triggerToast(`Sage PDF ${result.poNumber} attached to Airtable! Pulled ${result.pulledUnits.length} live units & generated pallet tags.`);
   };
 
   const handleAssignDriver = (orderOrAsnId: string, driverId: string) => {
@@ -201,7 +262,13 @@ function App() {
         <SageImportView
           assignments={assignments}
           onImportOrder={handleImportSageOrder}
+          onPdfOrderImported={handlePdfOrderImported}
           onAssignDriver={handleAssignDriver}
+          onViewTags={(units) => {
+            setAirtableUnits(units);
+            setTagFilter("airtable");
+            setTab("tags");
+          }}
           syncLog={airtableSyncLog}
           setTab={setTab}
           setSelectedDriver={setSelectedDriver}
@@ -232,7 +299,13 @@ function App() {
       {tab === "customer" && <CustomerView selectedCustomer={selectedCustomer} setSelectedCustomer={setSelectedCustomer} customerOrders={customerOrders} />}
       {tab === "map" && <WarehouseMap />}
       {tab === "reports" && <Reports />}
-      {tab === "tags" && <PalletTags />}
+      {tab === "tags" && (
+        <PalletTags
+          airtableUnits={airtableUnits}
+          filter={tagFilter}
+          setFilter={setTagFilter}
+        />
+      )}
     </main>
   );
 }
@@ -265,7 +338,7 @@ function OfficeDashboard({
       <div className="panel">
         <PanelTitle icon={<UserCheck size={19} />} title="Office Actions" action="Demo controls" />
         <div className="actions">
-          <button onClick={() => setTab("sage")} className="primary-action-btn"><Database size={17} /> Import orders from Sage</button>
+          <button onClick={() => setTab("sage")} className="primary-action-btn"><Database size={17} /> Sage PDF & ERP Inbound Intake</button>
           <button onClick={() => setTab("tags")}><Printer size={17} /> Print pallet tags</button>
           <button onClick={() => setTab("driver")}><Forklift size={17} /> Open driver board</button>
           <button onClick={() => setTab("map")}><MapPinned size={17} /> Review warehouse map</button>
@@ -313,7 +386,9 @@ function SageImportView(props: {
     unit: "pallets" | "boxes";
     driverId: string;
   }) => void;
+  onPdfOrderImported: (result: InboundParseResult, driverId: string) => void;
   onAssignDriver: (orderOrAsnId: string, driverId: string) => void;
+  onViewTags: (units: AirtableUnit[]) => void;
   syncLog: string[];
   setTab: (tab: Tab) => void;
   setSelectedDriver: (driverId: string) => void;
@@ -343,9 +418,87 @@ function SageImportView(props: {
 
   return (
     <section className="grid two">
-      {/* 1. Quick Sage Order Stream Simulator */}
+      {/* 1. Sage PDF Inbound Manifest & PO Uploader (Airtable Inbound Transactions + Document Attachments + Airtable AI + Unit Pull) */}
+      <div className="span">
+        <SagePdfUploader
+          onOrderImported={props.onPdfOrderImported}
+          onViewTags={props.onViewTags}
+          onGoToDriverBoard={(drvId) => {
+            props.setSelectedDriver(drvId);
+            props.setTab("driver");
+          }}
+        />
+      </div>
+
+      {/* 2. Driver Assignment & Manifest Spot */}
+      <div className="panel span">
+        <PanelTitle icon={<UserPlus size={19} />} title="Shipping Manifests & Driver Assignment Spot" action="Assign drivers as orders arrive" />
+        <p className="notice">
+          Assign drivers as orders arrive. Assigning a driver immediately pushes the task to that driver's iPad board in real time.
+        </p>
+
+        <div className="table sage-table">
+          <div className="sage-row head">
+            <span>Manifest / Order</span>
+            <span>Type</span>
+            <span>Title / Description</span>
+            <span>Airtable Sync</span>
+            <span>Assigned Driver</span>
+            <span>Action</span>
+          </div>
+          {props.assignments.map((asn) => {
+            const currentDriver = demoData.drivers.find((d) => d.id === asn.driverId);
+            return (
+              <div className="sage-row" key={asn.id}>
+                <span>
+                  <strong>{asn.id}</strong>
+                </span>
+                <span>
+                  <span className={`pill ${asn.type === "Receiving" ? "good" : "allocated"}`}>{asn.type}</span>
+                </span>
+                <span>{asn.title}</span>
+                <span>
+                  <span className="pill good"><Check size={13} /> Synced</span>
+                </span>
+                <span>
+                  <select
+                    className="driver-select"
+                    value={asn.driverId}
+                    onChange={(e) => props.onAssignDriver(asn.id, e.target.value)}
+                  >
+                    <option value="unassigned">-- Unassigned --</option>
+                    {demoData.drivers.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
+                </span>
+                <span>
+                  {currentDriver ? (
+                    <button
+                      className="inline-btn"
+                      onClick={() => {
+                        props.setSelectedDriver(currentDriver.id);
+                        props.setTab("driver");
+                      }}
+                      title="Jump to Driver Board"
+                    >
+                      <Forklift size={15} /> Open Board
+                    </button>
+                  ) : (
+                    <span className="text-muted">Unassigned</span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 3. Quick Sage Order Stream Simulator */}
       <div className="panel">
-        <PanelTitle icon={<Database size={19} />} title="Sage ERP Live Feed" action="1-Click Import" />
+        <PanelTitle icon={<Database size={19} />} title="Sage ERP Live Feed (Quick Stream)" action="1-Click Import" />
         <p className="notice">
           Simulated incoming orders from Sage 100/300 ERP. Importing maps the payload, syncs to Airtable, and pushes to shipping manifests.
         </p>
@@ -383,7 +536,7 @@ function SageImportView(props: {
         </div>
       </div>
 
-      {/* 2. Custom Sage Order Intake */}
+      {/* 4. Custom Sage Order Intake */}
       <div className="panel">
         <PanelTitle icon={<Plus size={19} />} title="Create Custom Sage Order" action="Direct Intake" />
         <form onSubmit={handleCustomSubmit} className="sage-form">
@@ -453,73 +606,7 @@ function SageImportView(props: {
         </form>
       </div>
 
-      {/* 3. Driver Assignment & Manifest Spot */}
-      <div className="panel span">
-        <PanelTitle icon={<UserPlus size={19} />} title="Shipping Manifests & Driver Assignment Spot" action="Assign drivers as orders arrive" />
-        <p className="notice">
-          Assign drivers as orders arrive. Assigning a driver immediately pushes the task to that driver's iPad board in real time.
-        </p>
-
-        <div className="table sage-table">
-          <div className="sage-row head">
-            <span>Manifest / Order</span>
-            <span>Type</span>
-            <span>Title / Description</span>
-            <span>Airtable Sync</span>
-            <span>Assigned Driver</span>
-            <span>Action</span>
-          </div>
-          {props.assignments.map((asn) => {
-            const currentDriver = demoData.drivers.find((d) => d.id === asn.driverId);
-            return (
-              <div className="sage-row" key={asn.id}>
-                <span>
-                  <strong>{asn.id}</strong>
-                </span>
-                <span>
-                  <span className={`pill ${asn.type === "Receiving" ? "good" : "allocated"}`}>{asn.type}</span>
-                </span>
-                <span>{asn.title}</span>
-                <span>
-                  <span className="pill good"><Check size={13} /> Synced</span>
-                </span>
-                <span>
-                  <select
-                    className="driver-select"
-                    value={asn.driverId}
-                    onChange={(e) => props.onAssignDriver(asn.id, e.target.value)}
-                  >
-                    <option value="unassigned">-- Unassigned --</option>
-                    {demoData.drivers.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
-                </span>
-                <span>
-                  {currentDriver ? (
-                    <button
-                      className="inline-btn"
-                      onClick={() => {
-                        props.setSelectedDriver(currentDriver.id);
-                        props.setTab("driver");
-                      }}
-                      title="Jump to Driver Board"
-                    >
-                      <Forklift size={15} /> Open Board
-                    </button>
-                  ) : (
-                    <span className="text-muted">Unassigned</span>
-                  )}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 4. Real-Time Airtable Sync Audit Log */}
+      {/* 5. Real-Time Airtable Sync Audit Log */}
       <div className="panel span">
         <PanelTitle icon={<RefreshCw size={19} />} title="Airtable Real-Time API Sync Log" action="Base appdSedUhOfcqzMUZ" />
         <div className="sync-log-box">
@@ -597,8 +684,8 @@ function DriverWorkflow(props: {
             secondLabel="Bin QR"
             firstValue={props.scan.receivingPallet ?? ""}
             secondValue={props.scan.receivingBin ?? ""}
-            firstSamples={["PAL:PAL-000105", "PAL:PAL-000106"]}
-            secondSamples={["BIN:B-E-03-L2", "BIN:C-W-01-L1"]}
+            firstSamples={["PAL:PAL-000105", "PAL:PAL-000106", "PAL:U-1001", "PAL:U-1003"]}
+            secondSamples={["BIN:B-E-03-L2", "BIN:C-W-01-L1", "BIN:BIN-001", "BIN:BIN-003"]}
             onFirst={(value) => props.setScan({ ...props.scan, receivingPallet: value })}
             onSecond={(value) => props.setScan({ ...props.scan, receivingBin: value })}
             result={props.receivingResult}
@@ -611,8 +698,8 @@ function DriverWorkflow(props: {
             secondLabel="Pallet QR"
             firstValue={props.scan.outboundBin ?? ""}
             secondValue={props.scan.outboundPallet ?? ""}
-            firstSamples={["BIN:A-W-02-L1", "BIN:C-E-02-L2"]}
-            secondSamples={["PAL:PAL-000087", "PAL:PAL-000044"]}
+            firstSamples={["BIN:A-W-02-L1", "BIN:C-E-02-L2", "BIN:BIN-006"]}
+            secondSamples={["PAL:PAL-000087", "PAL:PAL-000044", "PAL:U-1006"]}
             onFirst={(value) => props.setScan({ ...props.scan, outboundBin: value })}
             onSecond={(value) => props.setScan({ ...props.scan, outboundPallet: value })}
             result={props.outboundResult}
@@ -833,22 +920,145 @@ function Reports() {
   );
 }
 
-function PalletTags() {
-  const printable = demoData.pallets.slice(0, 6);
+function PalletTags({
+  airtableUnits = [],
+  filter = "all",
+  setFilter
+}: {
+  airtableUnits?: AirtableUnit[];
+  filter?: "all" | "airtable" | "demo";
+  setFilter?: (f: "all" | "airtable" | "demo") => void;
+}) {
+  const [internalFilter, setInternalFilter] = useState<"all" | "airtable" | "demo">(filter);
+  const activeFilter = setFilter ? filter : internalFilter;
+  const changeFilter = setFilter ?? setInternalFilter;
+
+  const demoPallets = demoData.pallets.slice(0, 6);
+
+  const displayAirtable = activeFilter === "all" || activeFilter === "airtable";
+  const displayDemo = activeFilter === "all" || activeFilter === "demo";
+
   return (
     <section className="panel">
-      <PanelTitle icon={<Printer size={19} />} title="Printable 4x4 Pallet Tags" action="QR demo" />
-      <div className="tag-grid">
-        {printable.map((pallet) => (
-          <div className="tag" key={pallet.id}>
-            <div className="fake-qr"><QrCode size={72} /></div>
-            <strong>{pallet.id}</strong>
-            <span>{pallet.product}</span>
-            <span>{pallet.lot} • {pallet.batch}</span>
-            <span>{pallet.currentBoxes} boxes • {pallet.assignedBin}</span>
-            <code>PAL:{pallet.id}</code>
+      <div className="panel-title">
+        <div>
+          <Printer size={19} className="text-accent" />
+          <div>
+            <h2 style={{ margin: 0 }}>Printable 4x4 QR Pallet Tags</h2>
+            <small className="notice">
+              Generated from Airtable Base appdSedUhOfcqzMUZ Units & Sage Inbound PO Manifests
+            </small>
           </div>
-        ))}
+        </div>
+        <div className="header-actions">
+          <div className="tag-filter-pills">
+            <button
+              className={`pill-btn ${activeFilter === "all" ? "active" : ""}`}
+              onClick={() => changeFilter("all")}
+            >
+              All Tags ({airtableUnits.length + demoPallets.length})
+            </button>
+            <button
+              className={`pill-btn ${activeFilter === "airtable" ? "active" : ""}`}
+              onClick={() => changeFilter("airtable")}
+            >
+              Airtable PDF Units ({airtableUnits.length})
+            </button>
+            <button
+              className={`pill-btn ${activeFilter === "demo" ? "active" : ""}`}
+              onClick={() => changeFilter("demo")}
+            >
+              Demo Pallets ({demoPallets.length})
+            </button>
+          </div>
+          <button
+            type="button"
+            className="primary-action-btn"
+            onClick={() => window.print()}
+          >
+            <Printer size={16} /> Print All Tags (4x4)
+          </button>
+        </div>
+      </div>
+
+      <div className="tag-grid print-area">
+        {/* Render Live Airtable Units */}
+        {displayAirtable &&
+          airtableUnits.map((unit) => (
+            <div className="tag printable-pallet-tag" key={`at-${unit.recordId}`}>
+              <div className="tag-header-row">
+                <span className="tag-company">AIRTABLE INBOUND UNIT</span>
+                <span className="pill good" style={{ fontSize: 10 }}>{unit.binZone}</span>
+              </div>
+              <div className="fake-qr">
+                <QrCode size={76} />
+              </div>
+              <strong className="tag-unit-id">{unit.unitId}</strong>
+              <span className="tag-product">{unit.productName}</span>
+              <span className="tag-sku">SKU: {unit.productSku}</span>
+              <div className="tag-meta-grid">
+                <div>
+                  <small>LOT #</small>
+                  <strong>{unit.lotNumber}</strong>
+                </div>
+                <div>
+                  <small>MFG DATE</small>
+                  <span>{unit.mfgDate || "2024-01-01"}</span>
+                </div>
+                <div>
+                  <small>QUANTITY</small>
+                  <strong>{unit.quantity} {unit.unitType}</strong>
+                </div>
+                <div>
+                  <small>ASSIGNED BIN</small>
+                  <strong className="tag-bin">{unit.binId}</strong>
+                </div>
+              </div>
+              <div className="tag-footer-row">
+                <code>PAL:{unit.unitId}</code>
+                <code>BIN:{unit.binId}</code>
+              </div>
+            </div>
+          ))}
+
+        {/* Render Demo Pallets */}
+        {displayDemo &&
+          demoPallets.map((pallet) => (
+            <div className="tag printable-pallet-tag" key={`demo-${pallet.id}`}>
+              <div className="tag-header-row">
+                <span className="tag-company">WAREHOUSE PALLET TAG</span>
+                <span className="tag-po">{pallet.customer}</span>
+              </div>
+              <div className="fake-qr">
+                <QrCode size={76} />
+              </div>
+              <strong className="tag-unit-id">{pallet.id}</strong>
+              <span className="tag-product">{pallet.product}</span>
+              <span className="tag-sku">{pallet.lot} • {pallet.batch}</span>
+              <div className="tag-meta-grid">
+                <div>
+                  <small>BOXES</small>
+                  <strong>{pallet.currentBoxes} boxes</strong>
+                </div>
+                <div>
+                  <small>AGE</small>
+                  <span>{pallet.ageDays} days</span>
+                </div>
+                <div>
+                  <small>STATUS</small>
+                  <span>{pallet.isPartial ? "Partial" : "Full Pallet"}</span>
+                </div>
+                <div>
+                  <small>ASSIGNED BIN</small>
+                  <strong className="tag-bin">{pallet.assignedBin}</strong>
+                </div>
+              </div>
+              <div className="tag-footer-row">
+                <code>PAL:{pallet.id}</code>
+                <code>BIN:{pallet.assignedBin}</code>
+              </div>
+            </div>
+          ))}
       </div>
     </section>
   );
@@ -859,14 +1069,26 @@ type ValidationResult = { status: "idle" | "ok" | "error"; message: string };
 function validateReceiving(palletQr?: string, binQr?: string): ValidationResult {
   if (!palletQr && !binQr) return { status: "idle", message: "Waiting for pallet scan." };
   if (!palletQr || !binQr) return { status: "idle", message: "Scan both pallet and bin to validate putaway." };
-  if (palletQr === "PAL:PAL-000105" && binQr === "BIN:B-E-03-L2") return { status: "ok", message: "Correct pallet and assigned bin. Putaway confirmed." };
+  if (
+    (palletQr === "PAL:PAL-000105" && binQr === "BIN:B-E-03-L2") ||
+    (palletQr === "PAL:U-1001" && binQr === "BIN:BIN-001") ||
+    (palletQr === "PAL:U-1003" && binQr === "BIN:BIN-003") ||
+    (palletQr === "PAL:U-1006" && binQr === "BIN:BIN-006")
+  ) {
+    return { status: "ok", message: "Correct pallet and assigned bin. Putaway confirmed in Airtable." };
+  }
   return { status: "error", message: "Mismatch. Driver cannot override this bin in the demo; office review required." };
 }
 
 function validateOutbound(binQr?: string, palletQr?: string): ValidationResult {
   if (!binQr && !palletQr) return { status: "idle", message: "Waiting for bin scan." };
   if (!binQr || !palletQr) return { status: "idle", message: "Scan both bin and pallet to validate pick." };
-  if (binQr === "BIN:A-W-02-L1" && palletQr === "PAL:PAL-000087") return { status: "ok", message: "Pick confirmed. Pallet can be loaded to outbound truck." };
+  if (
+    (binQr === "BIN:A-W-02-L1" && palletQr === "PAL:PAL-000087") ||
+    (binQr === "BIN:BIN-006" && palletQr === "PAL:U-1006")
+  ) {
+    return { status: "ok", message: "Pick confirmed. Pallet can be loaded to outbound truck." };
+  }
   return { status: "error", message: "Wrong bin or pallet for this pick task. Stop and check assignment." };
 }
 
